@@ -1,0 +1,8 @@
+{
+  "name": "ZERO - Universal App Architect",
+  "description": "An advanced AI-powered IDE and application builder that generates multi-platform, multi-language software with built-in compilation simulation and error correction.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
