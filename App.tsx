@@ -1,12 +1,10 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import JSZip from 'jszip';
 import { 
   Project,
   Platform,
   FileNode, 
-  Message, 
-  AIStatus 
+  Message
 } from './types';
 import { 
   IconFolder, 
@@ -23,7 +21,7 @@ import {
   IconUpload,
   IconLink
 } from './components/Icons';
-import { generateAppStructure, getSuggestions, fixCode, optimizeAndCorrectCode } from './services/geminiService';
+import { generateAppStructure, getSuggestions, fixCode, optimizeAndCorrectCode, generateBuildFiles } from './services/geminiService';
 import LivePreview from './components/LivePreview';
 import AIConfigModal from './components/AIConfigModal';
 
@@ -59,13 +57,8 @@ const INITIAL_PROJECT: Project = {
   config: {
     targetPlatform: Platform.WEB,
     language: 'TypeScript',
-    localAIEngine: {
-      status: 'idle',
-      downloadProgress: 0
-    },
-    localAIProviders: [],
     cloudAIProviders: [
-      { id: 'cloud-default-gemini', name: 'Default Gemini', provider: 'Gemini', model: 'gemini-3-pro-preview', apiKey: '' }
+      { id: 'cloud-default-gemini', name: 'Default Gemini', provider: 'Gemini', model: 'gemini-3-pro-preview' }
     ],
     activeAIProviderId: 'cloud-default-gemini'
   }
@@ -179,16 +172,28 @@ const App: React.FC = () => {
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        if (parsed.config.cloudAI) {
-            parsed.config.cloudAIProviders = [{ id: 'cloud-default-gemini', name: 'Default Gemini', provider: 'Gemini', model: parsed.config.cloudAI.model, apiKey: parsed.config.cloudAI.apiKey || '' }];
+
+        // Security cleanup: remove any saved API keys from older versions
+        if (parsed.config && parsed.config.cloudAIProviders) {
+            parsed.config.cloudAIProviders = parsed.config.cloudAIProviders.map((provider: any) => {
+                const { apiKey, ...rest } = provider;
+                return rest;
+            });
+        }
+        
+         // Legacy migration from very old format
+         if (parsed.config && parsed.config.cloudAI) {
+            parsed.config.cloudAIProviders = [{ id: 'cloud-default-gemini', name: 'Default Gemini', provider: 'Gemini', model: parsed.config.cloudAI.model }];
             delete parsed.config.cloudAI;
         }
-        if (parsed.config.localAI) {
-            parsed.config.localAIProviders = [];
-            parsed.config.localAIEngine = { status: parsed.config.localAI.engineStatus || 'idle' };
+        // Clean up local AI properties from previous versions
+        if (parsed.config) {
             delete parsed.config.localAI;
+            delete parsed.config.localAIEngine;
+            delete parsed.config.localAIProviders;
         }
-        if (!parsed.config.activeAIProviderId) {
+
+        if (parsed.config && !parsed.config.activeAIProviderId) {
             parsed.config.activeAIProviderId = 'cloud-default-gemini';
         }
         setProject(parsed);
@@ -208,8 +213,8 @@ const App: React.FC = () => {
   }, [messages]);
 
   const getActiveProvider = () => {
-    const { activeAIProviderId, cloudAIProviders, localAIProviders } = project.config;
-    return [...cloudAIProviders, ...localAIProviders].find(p => p.id === activeAIProviderId);
+    const { activeAIProviderId, cloudAIProviders } = project.config;
+    return cloudAIProviders.find(p => p.id === activeAIProviderId);
   };
 
   const handleNewProject = () => {
@@ -278,40 +283,57 @@ const App: React.FC = () => {
   };
   
   const handleExportProject = async () => {
-    if (isExporting) return;
+    if (isExporting || !selectedFormat) return;
     setIsExporting(true);
-  
-    const zip = new JSZip();
-  
-    const addFilesToZip = (nodes: FileNode[], currentPath: string) => {
-      nodes.forEach(node => {
-        const newPath = currentPath ? `${currentPath}/${node.name}` : node.name;
-        if (node.type === 'folder') {
-          addFilesToZip(node.children || [], newPath);
-        } else if (node.type === 'file') {
-          zip.file(newPath, node.content || '');
-        }
-      });
-    };
-  
-    addFilesToZip(project.structure, '');
+    setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', text: `Preparando arquivos de compilação para o formato: ${selectedFormat}...`, timestamp: Date.now() }]);
   
     try {
+      const buildFiles = await generateBuildFiles(project, selectedFormat);
+  
+      if (buildFiles && buildFiles.length > 0) {
+        setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: 'assistant', text: `Arquivos de compilação gerados com sucesso.` }]);
+      } else {
+        setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: 'system', text: `Nenhum arquivo de compilação adicional foi gerado. Prosseguindo com a exportação do código-fonte.` }]);
+      }
+      
+      setMessages(prev => [...prev, { id: (Date.now() + 2).toString(), role: 'system', text: `Compactando o projeto...` }]);
+      const zip = new JSZip();
+  
+      const addFilesToZip = (nodes: FileNode[], currentPath: string) => {
+        nodes.forEach(node => {
+          const newPath = currentPath ? `${currentPath}/${node.name}` : node.name;
+          if (node.type === 'folder') {
+            addFilesToZip(node.children || [], newPath);
+          } else if (node.type === 'file') {
+            zip.file(newPath, node.content || '');
+          }
+        });
+      };
+      addFilesToZip(project.structure, '');
+  
+      buildFiles.forEach(file => {
+        zip.file(file.path, file.content);
+      });
+  
       const content = await zip.generateAsync({ type: 'blob' });
       const link = document.createElement('a');
       link.href = URL.createObjectURL(content);
-      link.download = `${project.name.replace(/\s+/g, '_')}.zip`;
+      link.download = `${project.name.replace(/\s+/g, '_')}_${selectedFormat.replace(/[^a-zA-Z0-9]/g, '-')}.zip`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(link.href);
-    } catch (err) {
-      console.error("Failed to export project:", err);
-      alert("Houve um erro ao exportar o projeto.");
-    } finally {
-      setIsExporting(false);
+      
       setShowExportModal(false);
       setSelectedFormat('');
+
+    } catch (err) {
+      console.error("Failed to generate build files or export project:", err);
+      const errorMessage = "Ocorreu um erro ao gerar os arquivos de compilação. A exportação foi cancelada.";
+      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: 'system', text: errorMessage }]);
+      alert(errorMessage);
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -324,7 +346,7 @@ const App: React.FC = () => {
     setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', text: `Simulando erro: "${randomError}" em ${activeFile.name}...`, timestamp: Date.now() }]);
     
     try {
-      const fixedCode = await fixCode(activeFile.content || '', randomError, project);
+      const fixedCode = await fixCode(activeFile.content || '', randomError);
       setProject(prev => ({ ...prev, structure: updateFileContent(prev.structure, activeFile.id, fixedCode) }));
       setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: 'assistant', text: `Problema detectado e corrigido com sucesso em ${activeFile.name}.`, timestamp: Date.now() }]);
     } catch (error) {
@@ -479,7 +501,7 @@ const App: React.FC = () => {
           {isAutoSaving && <span className="text-[10px] text-zinc-500 animate-pulse uppercase tracking-widest">Auto-salvando...</span>}
           <div className="flex items-center gap-2 bg-zinc-900 rounded-xl p-1 pr-2 border border-zinc-800">
              <div className="px-2 py-1 rounded-lg text-xs flex items-center gap-2 bg-zinc-800">
-                { getActiveProvider()?.hasOwnProperty('apiKey') ? <IconBot /> : <IconCpu /> }
+                <IconBot />
                 <span className="font-medium text-zinc-300 truncate max-w-24">{getActiveProvider()?.name || 'N/A'}</span>
              </div>
              <button onClick={() => setShowAIConfigModal(true)} className="p-1.5 hover:bg-zinc-800 rounded-lg text-zinc-500 hover:text-indigo-400 transition" title="Configurações de IA"><IconSettings size={14} /></button>

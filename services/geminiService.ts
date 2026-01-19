@@ -1,18 +1,9 @@
-
 import { GoogleGenAI, Type } from "@google/genai";
 import { Project, FileNode, CloudAIInstance, Platform } from "../types";
 
-const getAIClient = (project?: Project) => {
-  if (!project) {
-    return new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-  }
-
-  const activeProvider = project.config.cloudAIProviders.find(
-    p => p.id === project.config.activeAIProviderId
-  );
-  
-  const apiKey = activeProvider?.apiKey || '';
-  return new GoogleGenAI({ apiKey });
+const getAIClient = () => {
+  // Security Fix: API key MUST be obtained exclusively from the environment variable.
+  return new GoogleGenAI({ apiKey: process.env.API_KEY });
 };
 
 const getWindowsGenerationPrompt = (userPrompt: string): string => `
@@ -102,7 +93,6 @@ Your task is to generate a complete, ready-to-compile project structure for a na
 6.  **Output Format:** Return a single JSON object with the project name and a flat list of all files, including their full path and content.
 `;
 
-// FIX: Added missing getDefaultGenerationPrompt function.
 const getDefaultGenerationPrompt = (userPrompt: string, platform: string): string => `
 You are an expert software architect.
 Your task is to generate a complete, ready-to-use project structure for an application on the specified platform based on the user's prompt.
@@ -119,9 +109,9 @@ Your task is to generate a complete, ready-to-use project structure for an appli
 `;
 
 
-export const generateAppStructure = async (prompt: string, platform: string, project?: Project): Promise<any> => {
-  const ai = getAIClient(project);
-  const activeProvider = project?.config.cloudAIProviders.find(p => p.id === project.config.activeAIProviderId);
+export const generateAppStructure = async (prompt: string, platform: string, project: Project): Promise<any> => {
+  const ai = getAIClient();
+  const activeProvider = project.config.cloudAIProviders.find(p => p.id === project.config.activeAIProviderId);
   const model = activeProvider?.model || 'gemini-3-pro-preview';
 
   let generationPrompt = '';
@@ -173,11 +163,20 @@ export const generateAppStructure = async (prompt: string, platform: string, pro
     }
   });
   
-  return JSON.parse(response.text || '{}');
+  try {
+    const text = response.text;
+    if (text) {
+      return JSON.parse(text);
+    }
+    return {};
+  } catch (e) {
+    console.error("Failed to parse JSON response:", e);
+    return {};
+  }
 };
 
 export const getSuggestions = async (project: Project): Promise<string> => {
-  const ai = getAIClient(project);
+  const ai = getAIClient();
   const activeProvider = project.config.cloudAIProviders.find(p => p.id === project.config.activeAIProviderId);
   const model = activeProvider?.model || 'gemini-3-flash-preview';
 
@@ -192,22 +191,20 @@ export const getSuggestions = async (project: Project): Promise<string> => {
   return response.text || "No suggestions available at this time.";
 };
 
-export const fixCode = async (code: string, error: string, project?: Project): Promise<string> => {
-  const ai = getAIClient(project);
-  const activeProvider = project?.config.cloudAIProviders.find(p => p.id === project.config.activeAIProviderId);
-  const model = activeProvider?.model || 'gemini-3-pro-preview';
+export const fixCode = async (code: string, error: string): Promise<string> => {
+  const ai = getAIClient();
 
   const response = await ai.models.generateContent({
-    model: model,
+    model: 'gemini-3-pro-preview', // Use a capable model for fixing
     contents: `Fix the following code which has this simulated error: ${error}\n\nCode:\n${code}`,
   });
   
   return response.text || code;
 };
 
-export const optimizeAndCorrectCode = async (fullCode: string, project?: Project): Promise<string> => {
-  const ai = getAIClient(project);
-  const activeProvider = project?.config.cloudAIProviders.find(p => p.id === project.config.activeAIProviderId);
+export const optimizeAndCorrectCode = async (fullCode: string, project: Project): Promise<string> => {
+  const ai = getAIClient();
+  const activeProvider = project.config.cloudAIProviders.find(p => p.id === project.config.activeAIProviderId);
   const model = activeProvider?.model || 'gemini-3-pro-preview';
 
   const response = await ai.models.generateContent({
@@ -215,8 +212,8 @@ export const optimizeAndCorrectCode = async (fullCode: string, project?: Project
     contents: `You are an expert software engineer. Analyze, optimize, and correct the following collection of files from a software project. Refactor for performance, fix potential bugs, and enhance security. Return only the complete, corrected code, maintaining the original file separation comments.
     
     Project context:
-    - Name: ${project?.name}
-    - Target Platform: ${project?.config.targetPlatform}
+    - Name: ${project.name}
+    - Target Platform: ${project.config.targetPlatform}
     
     Codebase:
     ---
@@ -225,3 +222,82 @@ export const optimizeAndCorrectCode = async (fullCode: string, project?: Project
   
   return response.text || fullCode;
 };
+
+export const generateBuildFiles = async (project: Project, format: string): Promise<{ path: string; content: string }[]> => {
+    const ai = getAIClient();
+    const activeProvider = project.config.cloudAIProviders.find(p => p.id === project.config.activeAIProviderId);
+    const model = activeProvider?.model || 'gemini-3-pro-preview';
+  
+    const projectFilesSummary: { path: string }[] = [];
+    const traverse = (nodes: FileNode[], path: string) => {
+        nodes.forEach(node => {
+            const currentPath = path ? `${path}/${node.name}` : node.name;
+            projectFilesSummary.push({ path: currentPath });
+            if (node.children) {
+                traverse(node.children, currentPath);
+            }
+        });
+    };
+    traverse(project.structure, '');
+  
+    const buildPrompt = `
+You are a build engineering expert and software architect. Your task is to generate the necessary configuration and script files to compile or package a given software project for a specific target format.
+
+**Project Context:**
+- **Project Name:** "${project.name}"
+- **Target Platform:** "${project.config.targetPlatform}"
+- **Selected Export Format:** "${format}"
+- **Project File Structure:**
+\`\`\`json
+${JSON.stringify(projectFilesSummary, null, 2)}
+\`\`\`
+
+**Instructions:**
+1.  Analyze the project context and the target export format ("${format}"). The full code is not provided, only the file structure. Infer the necessary build steps from the file names and platform.
+2.  Generate a set of NEW files required for the build process. Do NOT output any of the original files.
+3.  For "EXE (Tradicional)" on a C#/.NET project, generate a \`build.bat\` that uses \`dotnet publish\`. For other project types, suggest a suitable packager script (e.g., for Inno Setup or NSIS).
+4.  For "PWA (Manifests)", generate a \`manifest.json\`, a basic service worker file (\`sw.js\`), and instructions on where to include them.
+5.  For container formats like "OCI-Images (Docker/Podman)", generate a complete and working \`Dockerfile\` and a \`.dockerignore\` file.
+6.  Provide clear, step-by-step instructions in a \`BUILD_INSTRUCTIONS.md\` file on how to use the generated files to complete the build process on a user's local machine. This is the most important file.
+7.  Return ONLY a single, valid JSON object containing a flat list of the NEW files to be added to the project.
+
+**Output Format:**
+Return a single JSON object with a "files" key, which is an array of objects, each with a "path" and "content" property.
+`;
+  
+    const response = await ai.models.generateContent({
+      model: model,
+      contents: buildPrompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            files: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  path: { type: Type.STRING },
+                  content: { type: Type.STRING }
+                },
+                required: ["path", "content"]
+              }
+            }
+          }
+        }
+      }
+    });
+  
+    try {
+        const text = response.text;
+        if (text) {
+          const result = JSON.parse(text);
+          return result.files || [];
+        }
+        return [];
+      } catch (e) {
+        console.error("Failed to parse JSON response for build files:", e);
+        return [];
+      }
+  };
